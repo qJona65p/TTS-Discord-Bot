@@ -1,0 +1,4 @@
+davey==0.1.6
+discord.py==2.7.1
+emoji==2.16.0
+PyNaCl==1.6.2

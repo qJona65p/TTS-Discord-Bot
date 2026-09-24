@@ -48,6 +48,21 @@ LANG_MAP = {
     "de": "german", "fr": "french", "ru": "russian", "pt": "portuguese", "it": "italian",
 }
 
+LANG_LABELS = {
+    "es": "Español", "en": "Inglés", "zh": "Chino", "ja": "Japonés", "ko": "Coreano",
+    "de": "Alemán", "fr": "Francés", "ru": "Ruso", "pt": "Portugués", "it": "Italiano",
+}
+
+def normalize_lang(value: str):
+    """'es', 'Spanish' or 'Español' -> 'es'. Returns None if it isn't a supported language."""
+    v = (value or "").strip().lower()
+    if v in LANG_MAP:
+        return v
+    for code, name in LANG_MAP.items():
+        if v in (name.lower(), LANG_LABELS[code].lower()):
+            return code
+    return None
+
 # Built-in speakers of the CustomVoice checkpoints
 BUILTIN_SPEAKERS = ["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"]
 
@@ -220,9 +235,12 @@ class TTSBot(discord.Client):
         try:
             with open("user_configs.json", "r") as file:
                 data = json.load(file)
-                self.user_cfg = {
-                    int(k) if isinstance(k, str) and k.isdigit() else k: v for k, v in data.items()
-                }
+                self.user_cfg = {}
+                for k, v in data.items():
+                    key = int(k) if isinstance(k, str) and k.isdigit() else k
+                    # Old files stored just the voice name as a string
+                    self.user_cfg[key] = {"voice": v} if isinstance(v, str) else dict(v)
+
                 print("[TTSBot] Loaded user configs")
         except Exception as e:
             print(f"[TTSBot] Could not load user_configs.json: {e}")
@@ -235,11 +253,19 @@ class TTSBot(discord.Client):
     def resolve_speaker(self, user_id: int) -> str:
         """User's saved voice -> configured default -> first available. Old XTTS names fall through."""
         if self.tts:
-            saved = self.user_cfg.get(user_id)
+            saved = self.user_cfg.get(user_id, {}).get("voice")
             if saved and self.tts.find_speaker(saved):
                 return self.tts.find_speaker(saved)
             return self.tts.find_speaker(DEFAULT_SPEAKER) or self.tts.speakers[0]
         return DEFAULT_SPEAKER
+
+    def resolve_language(self, user_id: int) -> str:
+        """User's saved language -> configured default_lang -> Spanish. Always returns a code like 'es'."""
+        return (
+            normalize_lang(self.user_cfg.get(user_id, {}).get("lang"))
+            or normalize_lang(DEFAULT_LANGUAGE)
+            or "es"
+        )
 
     def reload_replacements(self, interaction: discord.Interaction=None):
         try:
@@ -440,7 +466,7 @@ class TTSBot(discord.Client):
         except Exception as e:
             print(f"[TTSBot] Idle Timer Error: {e}")
 
-    def preprocess_text(self, text:str):
+    def preprocess_text(self, text:str, lang: str = "es"):
         """Clean text for better TTS"""
         if not text:
             return ""
@@ -460,15 +486,19 @@ class TTSBot(discord.Client):
             return " "
 
         text = re.sub(r'<a?:[^:]+:\d+>', replace_discord_emoji, text)
-
-        emoji_mapping = self.replacements.get("emojis", {})
-        symbol_mapping = self.replacements.get("symbols", {})
+        section = self.replacements if lang == "es" else self.replacements.get(lang, {})
+        emoji_mapping = section.get("emojis", {})
+        symbol_mapping = section.get("symbols", {})
 
         # Convert emojis to descriptions
         def replace_unicode_emoji(emoji_char, data=None):
             if emoji_char in emoji_mapping:
                 return emoji_mapping[emoji_char]
-            return emoji.demojize(emoji_char, language="es").replace(":", " ").replace("_", " ").strip()
+            try:
+                name = emoji.demojize(emoji_char, language=lang)
+            except Exception:
+                name = emoji.demojize(emoji_char, language="en")  # language not covered by the emoji package
+            return name.replace(":", " ").replace("_", " ").strip()
 
         text = emoji.replace_emoji(text, replace=replace_unicode_emoji)
 
@@ -545,15 +575,16 @@ class TTSBot(discord.Client):
 
         # Get speaker for this user (or default)
         speaker = self.resolve_speaker(message.author.id)
+        lang = self.resolve_language(message.author.id)
 
         # Preprocess text + detect media
-        clean_text = self.preprocess_text(message.content)
+        clean_text = self.preprocess_text(message.content, lang)
 
         if message.attachments:
             clean_text += f" {MEDIA_MSG}"
 
         # Add to queue (text = message.content)
-        await self.queues[guild_id].put((clean_text, speaker, None))  # interaction=None for auto mode
+        await self.queues[guild_id].put((clean_text, speaker, lang, None))  # interaction=None for auto mode
 
         # Start queue processor
         asyncio.create_task(self.process_queue(guild_id))
@@ -573,18 +604,18 @@ class TTSBot(discord.Client):
         try:
             while True:
                 task = await asyncio.wait_for(self.queues[guild_id].get(), timeout=30)
-                text, speaker, interaction = task
+                text, speaker, lang, interaction = task
 
                 vc = self._voice_clients.get(guild_id)
                 if not vc or not vc.is_connected():
                     break
 
-                await self._play_text(vc, text, speaker, DEFAULT_LANGUAGE, interaction)
+                await self._play_text(vc, text, speaker, lang, interaction)
 
                 self.queues[guild_id].task_done()
 
                 # Small delay between messages
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
         except TimeoutError:
             pass
         except Exception as e:
@@ -603,6 +634,18 @@ class TTSBot(discord.Client):
             app_commands.Choice(name=speaker, value=speaker)
             for speaker in self.tts.speakers
             if current in speaker.lower()
+        ]
+        
+        # Return up to 25 choices (Discord limit)
+        return matching[:25]
+    
+    async def language_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Autocomplete for /setlang - matches the code, the Spanish name or the English name"""
+        current = current.lower().strip()
+        matching = [
+            app_commands.Choice(name=f"{LANG_LABELS[code]} ({code})", value=code)
+            for code, name in LANG_MAP.items()
+            if not current or current in code or current in name.lower() or current in LANG_LABELS[code].lower()
         ]
         
         # Return up to 25 choices (Discord limit)
@@ -717,11 +760,12 @@ async def tts(interaction: discord.Interaction, text: str):
     
     # Get user's chosen voice or default
     speaker = client.resolve_speaker(interaction.user.id)
+    lang = client.resolve_language(interaction.user.id)
 
     clean_text = client.preprocess_text(text)
 
     # Add to queue
-    await client.queues[interaction.guild.id].put((clean_text, speaker, interaction))
+    await client.queues[interaction.guild.id].put((clean_text, speaker, lang, interaction))
 
     # Start queue processor if not running
     asyncio.create_task(client.process_queue(interaction.guild.id))
@@ -747,9 +791,22 @@ async def setvoice(interaction: discord.Interaction, voice: str):
         return
     
     # Save option
-    client.user_cfg[interaction.user.id] = voice_name
+    client.user_cfg.setdefault(interaction.user.id, {})["voice"] = voice_name
     client.dump_user_configs()
     await interaction.response.send_message(f"Tu voz ha sido cambiada a **{voice}**.", ephemeral=True)
+
+@client.tree.command(name="setlang", description="Selecciona el idioma en el que habla tu voz")
+@app_commands.describe(language="Idioma (empieza a escribir para ver las opciones)")
+@app_commands.autocomplete(language=client.language_autocomplete)
+async def setlang(interaction: discord.Interaction, language: str):
+    code = normalize_lang(language)
+    if not code:
+        await interaction.response.send_message(f"El idioma **{language}** no existe.", ephemeral=True)
+        return
+
+    client.user_cfg.setdefault(interaction.user.id, {})["lang"] = code
+    client.dump_user_configs()
+    await interaction.response.send_message(f"Tu idioma ha sido cambiado a **{LANG_LABELS[code]}**.", ephemeral=True)
 
 @client.tree.command(name="voices", description="Muestra las voces disponibles")
 async def voices(interaction: discord.Interaction):

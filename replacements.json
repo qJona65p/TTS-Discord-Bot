@@ -61,5 +61,13 @@
         "XD": "equis d",
         "Xd": "equis d",
         "=": "igual"
+    },
+    "en": {
+        "emojis": {
+            "😂": "tears of joy"
+        },
+        "symbols": {
+            "...": " dot dot dot "
+        }
     }
 }
