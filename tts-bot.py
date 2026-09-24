@@ -9,13 +9,17 @@ import json
 import os
 import re
 
-import torch
-from TTS.api import TTS
+import atexit
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
 
-# -------------------    CONFIG    -------------------
+# ---------------------    CONFIGS    ---------------------
 
 config = configparser.ConfigParser()
-config.read("config.cfg")
+config.read(".env")
 
 BOT_TOKEN           = config["Bot"]["token"]
 IDLE_TIMEOUT        = int(config["Bot"]["idle_time"])
@@ -29,7 +33,140 @@ ADMIN_IDS           = list(int(i) for i in config["Admin"]["admin_ids"].split(",
 RESTRICT_VOICES     = list(i for i in config["Admin"]["restricted_voices"].split(","))
 AUTHORIZED_USERS    = list(int(i) for i in config["Admin"]["authorized_users"].split(","))
 
-# ----------------------------------------------------
+# qwentts.cpp tts-server
+SERVER_BIN          = config["TTS"].get("server_bin", "").strip()   # empty = server is started by you
+TALKER_GGUF         = config["TTS"].get("talker", "models/qwen-talker-1.7b-customvoice-Q8_0.gguf")
+CODEC_GGUF          = config["TTS"].get("codec", "models/qwen-tokenizer-12hz-Q8_0.gguf")
+SERVER_PORT         = int(config["TTS"].get("port", "8080"))
+UNLOAD_AFTER        = int(config["TTS"].get("unload_after", "0"))   # seconds idle before freeing VRAM, 0 = never
+
+# -------------    QWEN3-TTS (qwentts.cpp)    -------------
+
+# config.cfg uses short codes (es, en...), Qwen3-TTS wants language names
+LANG_MAP = {
+    "es": "spanish", "en": "english", "zh": "chinese", "ja": "japanese", "ko": "korean",
+    "de": "german", "fr": "french", "ru": "russian", "pt": "portuguese", "it": "italian",
+}
+
+# Built-in speakers of the CustomVoice checkpoints
+BUILTIN_SPEAKERS = ["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"]
+
+class QwenTTS:
+    """
+    Talks to a qwentts.cpp `tts-server` over HTTP. Keeps the `.speakers` / `.tts_to_file(...)`
+    interface the rest of the bot uses. If `server_bin` is set, this class starts the server
+    on demand and can stop it again when idle so the GPU memory is released.
+    """
+    ALIAS = "qwen3-tts-customvoice"
+ 
+    def __init__(self, server_bin: str, talker: str, codec: str, port: int):
+        self.server_bin = server_bin
+        self.talker = talker
+        self.codec = codec
+        self.url = f"http://127.0.0.1:{port}"
+        self.port = port
+        self.speakers = list(BUILTIN_SPEAKERS)
+        self.proc = None
+        self.last_used = time.monotonic()
+        self._lock = threading.Lock()       # one request at a time, also guards start/stop
+        self._log = None
+        atexit.register(self.stop)          # never leave a server holding VRAM behind
+ 
+    def find_speaker(self, name: str):
+        """Case-insensitive lookup, returns the canonical speaker name or None."""
+        for sp in self.speakers:
+            if sp.lower() == (name or "").strip().lower():
+                return sp
+        return None
+ 
+    def _is_up(self) -> bool:
+        try:
+            urllib.request.urlopen(f"{self.url}/v1/audio/voices", timeout=2)
+            return True
+        except urllib.error.HTTPError:
+            return True   # it answered, so it is listening
+        except Exception:
+            return False
+ 
+    def ensure_running(self, timeout: float = 120):
+        if self._is_up():
+            return
+        if not self.server_bin:
+            raise RuntimeError(f"tts-server is not reachable at {self.url} and 'server_bin' is not set in config.cfg")
+ 
+        if self.proc is None or self.proc.poll() is not None:
+            env = os.environ.copy()
+            env.setdefault("GGML_BACKEND", "CUDA0")
+            self._log = open("tts-server.log", "ab")
+            self.proc = subprocess.Popen(
+                [self.server_bin, "--model", self.talker, "--codec", self.codec,
+                "--alias", self.ALIAS, "--port", str(self.port)],
+                env=env, stdout=self._log, stderr=self._log,
+            )
+            print(f"[TTSBot] Starting tts-server (pid {self.proc.pid}) ...")
+ 
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("tts-server exited during startup, see tts-server.log")
+            if self._is_up():
+                print("[TTSBot] tts-server ready")
+                return
+            time.sleep(0.5)
+        raise RuntimeError("tts-server did not become ready in time, see tts-server.log")
+ 
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if self._log:
+            self._log.close()
+            self._log = None
+ 
+    def unload_if_idle(self, idle_seconds: int) -> bool:
+        """Stop the server we started if nobody used it for `idle_seconds`. Returns True if stopped."""
+        if not self.proc or not self._lock.acquire(blocking=False):
+            return False   # nothing to stop, or a request is in flight
+        try:
+            if self.proc and time.monotonic() - self.last_used > idle_seconds:
+                self.stop()
+                return True
+            return False
+        finally:
+            self._lock.release()
+ 
+    def tts_to_file(self, text: str, speaker: str, language: str, file_path: str):
+        body = json.dumps({
+            "model": self.ALIAS,
+            "input": text,
+            "voice": speaker.lower(),
+            "language": LANG_MAP.get(language.lower(), language),
+            "response_format": "wav",   # errors are reported properly with wav, not with pcm
+        }).encode("utf-8")
+ 
+        with self._lock:
+            self.last_used = time.monotonic()
+            self.ensure_running()
+            req = urllib.request.Request(
+                f"{self.url}/v1/audio/speech", data=body, headers={"Content-Type": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    audio = resp.read()
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(f"tts-server HTTP {e.code}: {e.read()[:200]!r}") from e
+            self.last_used = time.monotonic()
+ 
+        if not audio:
+            raise RuntimeError("tts-server returned empty audio")
+        with open(file_path, "wb") as f:
+            f.write(audio)
+ 
+# ---------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -39,7 +176,7 @@ class TTSBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tts = None
-        self.join_locks = {}   # guild_id -> asyncio.Lock
+        self.join_locks = {}            # guild_id -> asyncio.Lock
         self._voice_clients = {}        # guild_id -> voice_client
         self.user_cfg = {}              # user_id -> speaker_name
         self.banned_users = {}
@@ -56,13 +193,28 @@ class TTSBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        print("[TTSBot] Loading XTTS-v2 model ...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-        print(f"[TTSBot] XTTS model loaded successfully on {device}!")
+        self.tts = QwenTTS(SERVER_BIN, TALKER_GGUF, CODEC_GGUF, SERVER_PORT)
+        if UNLOAD_AFTER > 0:
+            print(f"[TTSBot] Model loads on first use and is freed after {UNLOAD_AFTER}s idle")
+            self._unload_task = asyncio.create_task(self._unload_watcher())
+        else:
+            print("[TTSBot] Loading Qwen3-TTS (qwentts.cpp) ...")
+            await asyncio.to_thread(self.tts.ensure_running)
 
         await self.tree.sync()
         print("[TTSBot] Bot ready and slash commands synced.")
+
+    async def _unload_watcher(self):
+        """Frees the GPU memory when TTS hasn't been used for UNLOAD_AFTER seconds."""
+        while True:
+            await asyncio.sleep(30)
+            if await asyncio.to_thread(self.tts.unload_if_idle, UNLOAD_AFTER):
+                print("[TTSBot] tts-server stopped (idle), VRAM released")
+ 
+    async def close(self):
+        if self.tts:
+            await asyncio.to_thread(self.tts.stop)
+        await super().close()
 
     def load_user_configs(self):
         try:
@@ -79,6 +231,15 @@ class TTSBot(discord.Client):
         with open("user_configs.json", "w") as f:
             json.dump(self.user_cfg, f, indent=4)
         print("[TTSBot] Saved user configs")
+
+    def resolve_speaker(self, user_id: int) -> str:
+        """User's saved voice -> configured default -> first available. Old XTTS names fall through."""
+        if self.tts:
+            saved = self.user_cfg.get(user_id)
+            if saved and self.tts.find_speaker(saved):
+                return self.tts.find_speaker(saved)
+            return self.tts.find_speaker(DEFAULT_SPEAKER) or self.tts.speakers[0]
+        return DEFAULT_SPEAKER
 
     def reload_replacements(self, interaction: discord.Interaction=None):
         try:
@@ -97,7 +258,7 @@ class TTSBot(discord.Client):
             new_config = configparser.ConfigParser()
             new_config.read("config.cfg")
 
-            # Update the values you actually use at runtime
+            # Update the values that are actually in use at runtime
             global IDLE_TIMEOUT, ALLOWED_CHANNEL_ID, DEFAULT_LANGUAGE, DEFAULT_SPEAKER, MEDIA_MSG, ADMIN_IDS, RESTRICT_VOICES, AUTHORIZED_USERS
 
             IDLE_TIMEOUT        = int(new_config["Bot"]["idle_time"])
@@ -383,11 +544,7 @@ class TTSBot(discord.Client):
             return
 
         # Get speaker for this user (or default)
-        default_speaker = DEFAULT_SPEAKER
-        if self.tts and self.tts.speakers:
-            default_speaker = self.tts.speakers[20]
-
-        speaker = self.user_cfg.get(message.author.id, default_speaker)
+        speaker = self.resolve_speaker(message.author.id)
 
         # Preprocess text + detect media
         clean_text = self.preprocess_text(message.content)
@@ -489,7 +646,7 @@ class TTSBot(discord.Client):
         await asyncio.sleep(0.3)
         self._intentional_disconnect.discard(guild_id)
     
-# -------------------- BOT EVENTS --------------------
+# ---------------------- BOT EVENTS ----------------------
 client = TTSBot()
 
 @client.event
@@ -558,8 +715,8 @@ async def tts(interaction: discord.Interaction, text: str):
     if not vc:
         return
     
-    # Get user's chosen voice or default (first speaker)
-    speaker = client.user_cfg.get(interaction.user.id, client.tts.speakers[20] if client.tts.speakers else DEFAULT_SPEAKER)
+    # Get user's chosen voice or default
+    speaker = client.resolve_speaker(interaction.user.id)
 
     clean_text = client.preprocess_text(text)
 
@@ -594,7 +751,7 @@ async def setvoice(interaction: discord.Interaction, voice: str):
     client.dump_user_configs()
     await interaction.response.send_message(f"Tu voz ha sido cambiada a **{voice}**.", ephemeral=True)
 
-@client.tree.command(name="voices", description="Muestra las voces disponibles en XTTS-v2")
+@client.tree.command(name="voices", description="Muestra las voces disponibles")
 async def voices(interaction: discord.Interaction):
     if not client.tts or not client.tts.speakers:
         await interaction.response.send_message("Las voces aún no están cargadas.", ephemeral=True)
@@ -626,7 +783,7 @@ async def leave(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("El bot no está en ningún canal de voz.", ephemeral=True)
 
-# ----------------  ADMINS COMMANDS   ----------------
+# -------------------  ADMIN COMMANDS   -------------------
 
 @client.tree.command(name="ban", description="Bloquear el uso del bot a un usuario")
 @app_commands.describe(user="Usuario a banear")
