@@ -19,7 +19,7 @@ import urllib.request
 # ---------------------    CONFIGS    ---------------------
 
 config = configparser.ConfigParser()
-config.read(".env")
+config.read("config.cfg")
 
 BOT_TOKEN           = config["Bot"]["token"]
 IDLE_TIMEOUT        = int(config["Bot"]["idle_time"])
