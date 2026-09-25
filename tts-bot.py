@@ -40,6 +40,30 @@ CODEC_GGUF          = config["TTS"].get("codec", "models/qwen-tokenizer-12hz-Q8_
 SERVER_PORT         = int(config["TTS"].get("port", "8080"))
 UNLOAD_AFTER        = int(config["TTS"].get("unload_after", "0"))   # seconds idle before freeing VRAM, 0 = never
 
+# Fallback description used by users who haven't written their own (VoiceDesign mode only).
+# Per Qwen's docs the description itself must be written in English or Chinese.
+DEFAULT_VOICE_DESCRIPTION = config["TTS"].get(
+    "default_voice_description", "Neutral adult voice, warm tone, moderate pace."
+).strip()
+
+def detect_talker_mode(path: str):
+    """'.../qwen-talker-1.7b-customvoice-Q8_0.gguf' -> 'customvoice'. None if it can't tell."""
+    name = os.path.basename(path).lower()
+    if "customvoice" in name:
+        return "customvoice"
+    if "voicedesign" in name:
+        return "voicedesign"
+    return None
+
+# Hot-swap support: which talker is configured decides how the whole bot behaves.
+# Auto-detected from the file name; override with 'mode = customvoice' or 'mode = voicedesign'.
+TALKER_MODE = config["TTS"].get("mode", "").strip().lower() or detect_talker_mode(TALKER_GGUF)
+if TALKER_MODE not in ("customvoice", "voicedesign"):
+    raise SystemExit(
+        f"[TTSBot] Could not tell whether '{TALKER_GGUF}' is a CustomVoice or VoiceDesign talker.\n"
+        f"Set 'mode = customvoice' or 'mode = voicedesign' under [TTS] in config.cfg."
+    )
+
 # -------------    QWEN3-TTS (qwentts.cpp)    -------------
 
 # config.cfg uses short codes (es, en...), Qwen3-TTS wants language names
@@ -71,15 +95,20 @@ class QwenTTS:
     Talks to a qwentts.cpp `tts-server` over HTTP. Keeps the `.speakers` / `.tts_to_file(...)`
     interface the rest of the bot uses. If `server_bin` is set, this class starts the server
     on demand and can stop it again when idle so the GPU memory is released.
+    
+    Behaves according to `mode`, which mirrors whichever talker is loaded:
+      - "customvoice": named speakers, `tts_to_file(..., speaker=...)`
+      - "voicedesign": freeform descriptions, `tts_to_file(..., instruct=...)`
     """
-    ALIAS = "qwen3-tts-customvoice"
  
-    def __init__(self, server_bin: str, talker: str, codec: str, port: int):
+    def __init__(self, server_bin: str, talker: str, codec: str, port: int, mode: str):
         self.server_bin = server_bin
         self.talker = talker
         self.codec = codec
         self.url = f"http://127.0.0.1:{port}"
         self.port = port
+        self.mode = mode
+        self.alias = f"qwen3-tts-{mode}"
         self.speakers = list(BUILTIN_SPEAKERS)
         self.proc = None
         self.last_used = time.monotonic()
@@ -115,7 +144,7 @@ class QwenTTS:
             self._log = open("tts-server.log", "ab")
             self.proc = subprocess.Popen(
                 [self.server_bin, "--model", self.talker, "--codec", self.codec,
-                "--alias", self.ALIAS, "--port", str(self.port)],
+                "--alias", self.alias, "--port", str(self.port)],
                 env=env, stdout=self._log, stderr=self._log,
             )
             print(f"[TTSBot] Starting tts-server (pid {self.proc.pid}) ...")
@@ -154,14 +183,22 @@ class QwenTTS:
         finally:
             self._lock.release()
  
-    def tts_to_file(self, text: str, speaker: str, language: str, file_path: str):
-        body = json.dumps({
-            "model": self.ALIAS,
+    def tts_to_file(self, text: str, language: str, file_path: str, speaker: str = None, instruct: str = None):
+        payload = {
+            "model": self.alias,
             "input": text,
-            "voice": speaker.lower(),
             "language": LANG_MAP.get(language.lower(), language),
             "response_format": "wav",   # errors are reported properly with wav, not with pcm
-        }).encode("utf-8")
+        }
+        if self.mode == "customvoice":
+            if not speaker:
+                raise ValueError("customvoice mode needs a speaker name")
+            payload["voice"] = speaker.lower()
+        else:
+            if not instruct:
+                raise ValueError("voicedesign mode needs an instruct description")
+            payload["instructions"] = instruct
+        body = json.dumps(payload).encode("utf-8")
  
         with self._lock:
             self.last_used = time.monotonic()
@@ -193,7 +230,7 @@ class TTSBot(discord.Client):
         self.tts = None
         self.join_locks = {}            # guild_id -> asyncio.Lock
         self._voice_clients = {}        # guild_id -> voice_client
-        self.user_cfg = {}              # user_id -> speaker_name
+        self.user_cfg = {}              # user_id -> {"voice": speaker_name, "description": text, "lang": code}
         self.banned_users = {}
 
         self.load_bans()
@@ -208,7 +245,8 @@ class TTSBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        self.tts = QwenTTS(SERVER_BIN, TALKER_GGUF, CODEC_GGUF, SERVER_PORT)
+        print(f"[TTSBot] Talker mode: {TALKER_MODE} ({TALKER_GGUF})")
+        self.tts = QwenTTS(SERVER_BIN, TALKER_GGUF, CODEC_GGUF, SERVER_PORT, TALKER_MODE)
         if UNLOAD_AFTER > 0:
             print(f"[TTSBot] Model loads on first use and is freed after {UNLOAD_AFTER}s idle")
             self._unload_task = asyncio.create_task(self._unload_watcher())
@@ -250,10 +288,18 @@ class TTSBot(discord.Client):
             json.dump(self.user_cfg, f, indent=4)
         print("[TTSBot] Saved user configs")
 
-    def resolve_speaker(self, user_id: int) -> str:
-        """User's saved voice -> configured default -> first available. Old XTTS names fall through."""
+    def resolve_voice(self, user_id: int) -> str:
+        """
+        Returns whatever the currently loaded talker needs from this user:
+        a speaker name in customvoice mode, or a voice description in voicedesign mode.
+        """
+        cfg = self.user_cfg.get(user_id, {})
+        
+        if TALKER_MODE == "voicedesign":
+            return (cfg.get("description") or "").strip() or DEFAULT_VOICE_DESCRIPTION
+
         if self.tts:
-            saved = self.user_cfg.get(user_id, {}).get("voice")
+            saved = cfg.get("voice")
             if saved and self.tts.find_speaker(saved):
                 return self.tts.find_speaker(saved)
             return self.tts.find_speaker(DEFAULT_SPEAKER) or self.tts.speakers[0]
@@ -285,12 +331,13 @@ class TTSBot(discord.Client):
             new_config.read("config.cfg")
 
             # Update the values that are actually in use at runtime
-            global IDLE_TIMEOUT, ALLOWED_CHANNEL_ID, DEFAULT_LANGUAGE, DEFAULT_SPEAKER, MEDIA_MSG, ADMIN_IDS, RESTRICT_VOICES, AUTHORIZED_USERS
+            global IDLE_TIMEOUT, ALLOWED_CHANNEL_ID, DEFAULT_LANGUAGE, DEFAULT_SPEAKER, DEFAULT_VOICE_DESCRIPTION, MEDIA_MSG, ADMIN_IDS, RESTRICT_VOICES, AUTHORIZED_USERS
 
             IDLE_TIMEOUT        = int(new_config["Bot"]["idle_time"])
             ALLOWED_CHANNEL_ID  = int(new_config["TTS"]["channel"]) if new_config["TTS"]["channel"].strip() else None
             DEFAULT_LANGUAGE    = new_config["TTS"]["default_lang"]
             DEFAULT_SPEAKER     = new_config["TTS"]["default_sp"]
+            DEFAULT_VOICE_DESCRIPTION = new_config["TTS"].get("default_voice_description", "Neutral adult voice, warm tone, moderate pace.").strip()
             MEDIA_MSG           = new_config["TTS"]["media_msg"]
             ADMIN_IDS           = list(int(i) for i in new_config["Admin"]["admin_ids"].split(","))
             RESTRICT_VOICES     = list(i for i in new_config["Admin"]["restricted_voices"].split(","))
@@ -508,10 +555,10 @@ class TTSBot(discord.Client):
 
         return text
 
-    async def _play_text(self, voice_client, text: str, speaker: str, language: str, interaction=None):
+    async def _play_text(self, voice_client, text: str, voice_param: str, language: str, interaction=None):
         """Internal method to generate and play one message"""
 
-        sentences = re.split(r'(?<=[.!?])\s+', text)
+        sentences = re.split(r'(?<=[.])\s+', text)
 
         for sentence in sentences:
             if not sentence.strip():
@@ -524,12 +571,13 @@ class TTSBot(discord.Client):
 
                 temp_path = f"temp_tts_{voice_client.guild.id}.wav"
                 
+                kwargs = {"speaker": voice_param} if TALKER_MODE == "customvoice" else {"instruct": voice_param}
                 await asyncio.to_thread(
                     self.tts.tts_to_file,
                     text=sentence.strip(),
-                    speaker=speaker,
                     language=language,
-                    file_path=temp_path
+                    file_path=temp_path,
+                    **kwargs,
                 )
                 if not voice_client.is_connected():  # Check again after TTS generation
                     return
@@ -574,7 +622,7 @@ class TTSBot(discord.Client):
             return
 
         # Get speaker for this user (or default)
-        speaker = self.resolve_speaker(message.author.id)
+        voice_param = client.resolve_voice(message.author.id)
         lang = self.resolve_language(message.author.id)
 
         # Preprocess text + detect media
@@ -584,7 +632,7 @@ class TTSBot(discord.Client):
             clean_text += f" {MEDIA_MSG}"
 
         # Add to queue (text = message.content)
-        await self.queues[guild_id].put((clean_text, speaker, lang, None))  # interaction=None for auto mode
+        await self.queues[guild_id].put((clean_text, voice_param, lang, None))  # interaction=None for auto mode
 
         # Start queue processor
         asyncio.create_task(self.process_queue(guild_id))
@@ -604,13 +652,13 @@ class TTSBot(discord.Client):
         try:
             while True:
                 task = await asyncio.wait_for(self.queues[guild_id].get(), timeout=30)
-                text, speaker, lang, interaction = task
+                text, voice_param, lang, interaction = task
 
                 vc = self._voice_clients.get(guild_id)
                 if not vc or not vc.is_connected():
                     break
 
-                await self._play_text(vc, text, speaker, lang, interaction)
+                await self._play_text(vc, text, voice_param, lang, interaction)
 
                 self.queues[guild_id].task_done()
 
@@ -624,8 +672,9 @@ class TTSBot(discord.Client):
             self.processing[guild_id] = False
 
     async def voice_autocomplete(self, interaction: discord.Interaction, current: str):
-        """Autocomplete for /setvoice - shows only real speakers"""
-        if not self.tts or not self.tts.speakers:
+        """Autocomplete for /setvoice - shows the built-in speakers (customvoice mode only;
+        in voicedesign mode /setvoice takes freeform text, so there is nothing to suggest)"""
+        if TALKER_MODE != "customvoice" or not self.tts or not self.tts.speakers:
             return []
         
         # Filter speakers that match what the user is typing
@@ -759,23 +808,49 @@ async def tts(interaction: discord.Interaction, text: str):
         return
     
     # Get user's chosen voice or default
-    speaker = client.resolve_speaker(interaction.user.id)
+    voice_param = client.resolve_voice(interaction.user.id)
     lang = client.resolve_language(interaction.user.id)
 
     clean_text = client.preprocess_text(text)
 
     # Add to queue
-    await client.queues[interaction.guild.id].put((clean_text, speaker, lang, interaction))
+    await client.queues[interaction.guild.id].put((clean_text, voice_param, lang, interaction))
 
     # Start queue processor if not running
     asyncio.create_task(client.process_queue(interaction.guild.id))
 
-    await interaction.followup.send(f"**{speaker}** en cola ({client.queues[interaction.guild.id].qsize()} mensajes)", ephemeral=True)
+    label = voice_param if TALKER_MODE == "customvoice" else "tu voz"
+    await interaction.followup.send(f"**{label}** en cola ({client.queues[interaction.guild.id].qsize()} mensajes)", ephemeral=True)
 
-@client.tree.command(name="setvoice", description="Selecciona la voz para el TTS")
-@app_commands.describe(voice="Nombre de la voz (usa /voices para verlas)")
+_SETVOICE_DESCRIPTIONS = {
+    "customvoice": "Selecciona la voz para el TTS",
+    "voicedesign": "Describe la voz que quieres (en inglés o chino, ej: 'Warm, gentle young female voice.')",
+}
+_SETVOICE_PARAM_DESCRIPTIONS = {
+    "customvoice": "Nombre de la voz (usa /voices para verlas)",
+    "voicedesign": "Descripción de la voz, en inglés o chino, máx. 2048 caracteres",
+}
+
+
+@client.tree.command(name="setvoice", description=_SETVOICE_DESCRIPTIONS[TALKER_MODE])
+@app_commands.describe(voice=_SETVOICE_PARAM_DESCRIPTIONS[TALKER_MODE])
 @app_commands.autocomplete(voice=client.voice_autocomplete)
 async def setvoice(interaction: discord.Interaction, voice: str):
+    voice = voice.strip()
+
+    if TALKER_MODE == "voicedesign":
+        if not voice:
+            await interaction.response.send_message("La descripción no puede estar vacía.", ephemeral=True)
+            return
+        if len(voice) > 2048:
+            await interaction.response.send_message("La descripción es demasiado larga (máx. 2048 caracteres).", ephemeral=True)
+            return
+
+        client.user_cfg.setdefault(interaction.user.id, {})["description"] = voice
+        client.dump_user_configs()
+        await interaction.response.send_message(f"Tu voz ha sido descrita como:\n> {voice}", ephemeral=True)
+        return
+    
     if not client.tts or not client.tts.speakers:
         await interaction.response.send_message("El modelo aún no ha cargado las voces.", ephemeral=True)
         return
@@ -784,14 +859,12 @@ async def setvoice(interaction: discord.Interaction, voice: str):
         await interaction.response.send_message(f"La voz **{voice}** no existe.\n", ephemeral=True)
         return
 
-    voice_name = voice.strip()
-
-    if voice_name in RESTRICT_VOICES and interaction.user.id != AUTHORIZED_USERS[RESTRICT_VOICES.index(voice_name)]: # Restriccion de voces
+    if voice in RESTRICT_VOICES and interaction.user.id != AUTHORIZED_USERS[RESTRICT_VOICES.index(voice)]: # Restriccion de voces
         await interaction.response.send_message(f"No autorizo.\n", ephemeral=True)
         return
     
     # Save option
-    client.user_cfg.setdefault(interaction.user.id, {})["voice"] = voice_name
+    client.user_cfg.setdefault(interaction.user.id, {})["voice"] = voice
     client.dump_user_configs()
     await interaction.response.send_message(f"Tu voz ha sido cambiada a **{voice}**.", ephemeral=True)
 
@@ -810,6 +883,22 @@ async def setlang(interaction: discord.Interaction, language: str):
 
 @client.tree.command(name="voices", description="Muestra las voces disponibles")
 async def voices(interaction: discord.Interaction):
+    if TALKER_MODE == "voicedesign":
+        current = client.user_cfg.get(interaction.user.id, {}).get("description")
+        embed = discord.Embed(
+            title="Voz por descripción",
+            description=(
+                "Este modelo no tiene voces con nombre: cada quien describe la suya con `/setvoice`.\n"
+                "Escribe la descripción en **inglés o chino**, 1-3 frases con detalles concretos.\n\n"
+                "Ejemplo: `/setvoice Warm, gentle young female voice, calm and slightly slow pace.`"
+            ),
+            color=0x00ff00,
+        )
+        embed.add_field(name="Tu descripción actual", value=f"> {current}" if current else "*(usando la de por defecto)*", inline=False)
+        embed.set_footer(text=f"Por defecto: {DEFAULT_VOICE_DESCRIPTION}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
     if not client.tts or not client.tts.speakers:
         await interaction.response.send_message("Las voces aún no están cargadas.", ephemeral=True)
         return
